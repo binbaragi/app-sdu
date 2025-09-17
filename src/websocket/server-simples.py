@@ -5,14 +5,21 @@ clientes = set()
 
 async def echo(websocket):
     clientes.add(websocket)
-    async for message in websocket:
-        print(f"Mensagem {message} recebida do cliente {websocket.remote_address}")
-        await websocket.send(f"Recebi sua mensagem!")
-        if clientes:
-            print(f"Clientes conectados: {len(clientes)}")
+    try:
+        print(f"Novo cliente conectado: {websocket.remote_address}")
+        print(f"Total de clientes conectados: {len(clientes)}")
+        
+        async for message in websocket:
+            print(f"Mensagem recebida de {websocket.remote_address}: {message}")
+            # Envia a mensagem para todos os outros clientes
             for client in clientes:
                 if client != websocket:
-                    await client.send(f"Cliente {websocket.remote_address} disse: {message}")
+                    await client.send(f"{websocket.remote_address}: {message}")
+    except websockets.exceptions.ConnectionClosed:
+        print(f"Cliente {websocket.remote_address} desconectou")
+    finally:
+        clientes.remove(websocket)
+        print(f"Total de clientes conectados: {len(clientes)}")
 
 async def main():
     async with websockets.serve(echo, "localhost", 8765):
