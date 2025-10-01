@@ -11,7 +11,6 @@ async def echo(websocket):
         
         async for message in websocket:
             print(f"Mensagem recebida de {websocket.remote_address}: {message}")
-            # Envia a mensagem para todos os outros clientes
             for client in clientes:
                 if client != websocket:
                     await client.send(f"{websocket.remote_address}: {message}")
