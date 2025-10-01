@@ -4,7 +4,7 @@ def on_connect(ws):
     print("Conectado ao servidor.")
 
 def on_message(ws, message):
-    print(message)  # Mostra a mensagem diretamente, já que o servidor inclui o remetente
+    print(message)
 
 def on_error(ws, error):
     print(f"Erro: {error}")
