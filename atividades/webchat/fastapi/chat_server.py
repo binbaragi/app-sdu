@@ -2,13 +2,15 @@
 from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional, Set, List
-import os, json
+import os, json, threading
 
 import jwt  # pip install pyjwt
+import pika  # pip install pika
 from passlib.context import CryptContext  # pip install passlib[bcrypt]
 from fastapi import (
     FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, Query
 )
+from fastapi.staticfiles import StaticFiles
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -19,6 +21,13 @@ from pydantic import BaseModel, Field
 JWT_SECRET = os.getenv("JWT_SECRET", "troque-este-segredo")  # use Secret Manager/variável de ambiente em produção
 JWT_ALG = os.getenv("JWT_ALG", "HS256")
 ACCESS_TTL_MIN = int(os.getenv("ACCESS_TTL_MIN", "60"))
+
+# Configuração RabbitMQ
+RABBITMQ_HOST = os.getenv("RABBITMQ_HOST", "localhost")
+RABBITMQ_PORT = int(os.getenv("RABBITMQ_PORT", "5672"))
+RABBITMQ_USER = os.getenv("RABBITMQ_USER", "guest")
+RABBITMQ_PASS = os.getenv("RABBITMQ_PASS", "guest")
+BROADCAST_EXCHANGE = "chat_broadcast"
 
 pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/login")
@@ -97,6 +106,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Serve static files from ./client at /client
+app.mount("/client", StaticFiles(directory="client", html=True), name="client")
+
 # =========================
 # Camada API (auth, perfil, listagem)
 # =========================
@@ -123,10 +135,65 @@ def list_online(_: str = Depends(current_username)):
 def healthz():
     return {"status": "ok", "time": _iso()}
 
+class MessageBroker:
+    def __init__(self):
+        self._init_connection()
+
+    def _init_connection(self):
+        # Conexão com RabbitMQ
+        credentials = pika.PlainCredentials(RABBITMQ_USER, RABBITMQ_PASS)
+        parameters = pika.ConnectionParameters(
+            host=RABBITMQ_HOST,
+            port=RABBITMQ_PORT,
+            credentials=credentials,
+            heartbeat=600,
+            blocked_connection_timeout=300
+        )
+        self.connection = pika.BlockingConnection(parameters)
+        self.channel = self.connection.channel()
+        
+        # Declara exchange para broadcast
+        self.channel.exchange_declare(
+            exchange=BROADCAST_EXCHANGE,
+            exchange_type='fanout',
+            durable=True
+        )
+
+    def declare_user_queue(self, username: str):
+        """Cria fila exclusiva para usuário"""
+        self.channel.queue_declare(queue=f"user_{username}", durable=True)
+
+    def send_direct(self, username: str, message: dict):
+        """Envia mensagem direta para usuário"""
+        try:
+            self.channel.basic_publish(
+                exchange='',
+                routing_key=f"user_{username}",
+                body=json.dumps(message),
+                properties=pika.BasicProperties(delivery_mode=2)  # persistente
+            )
+        except Exception as e:
+            print(f"Erro ao enviar mensagem para {username}: {e}")
+            self._init_connection()
+
+    def broadcast(self, message: dict):
+        """Envia mensagem para todos via exchange"""
+        try:
+            self.channel.basic_publish(
+                exchange=BROADCAST_EXCHANGE,
+                routing_key='',
+                body=json.dumps(message),
+                properties=pika.BasicProperties(delivery_mode=2)
+            )
+        except Exception as e:
+            print(f"Erro ao fazer broadcast: {e}")
+            self._init_connection()
+
 class ConnectionManager:
     def __init__(self):
         self.active: Dict[str, WebSocket] = {}  # username -> ws
-        self.typing: Set[str] = set()           # usuários atualmente digitando
+        self.typing: Set[str] = set()          # usuários digitando
+        self.broker = MessageBroker()
 
     async def connect(self, username: str, websocket: WebSocket):
         old = self.active.get(username)
@@ -136,12 +203,19 @@ class ConnectionManager:
             except Exception:
                 pass
         self.active[username] = websocket
+        self.broker.declare_user_queue(username)
 
     def disconnect(self, username: str):
         self.active.pop(username, None)
         self.typing.discard(username)
 
     async def send_to(self, username: str, payload: dict) -> bool:
+        # Para mensagens, usa RabbitMQ
+        if payload.get("type") == "message":
+            self.broker.send_direct(username, payload)
+            return True
+        
+        # Para outros tipos (presence, typing), usa WebSocket
         ws = self.active.get(username)
         if not ws:
             return False
@@ -153,6 +227,12 @@ class ConnectionManager:
             return False
 
     async def broadcast(self, payload: dict):
+        # Mensagens vão pelo RabbitMQ
+        if payload.get("type") == "message":
+            self.broker.broadcast(payload)
+            return
+
+        # Outros tipos (presence, typing) continuam via WebSocket
         dead: Set[str] = set()
         for user, ws in self.active.items():
             try:
@@ -196,6 +276,9 @@ async def ws_endpoint(websocket: WebSocket, token: Optional[str] = Query(default
             await websocket.close(code=4403); return
     except HTTPException:
         await websocket.close(code=4401); return
+
+    # Configuração RabbitMQ para o usuário
+    manager.broker.declare_user_queue(username)
 
     # Conecta e anuncia presença
     await manager.connect(username, websocket)

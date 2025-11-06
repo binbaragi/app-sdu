@@ -1,8 +1,11 @@
 let ws = null;
+let stompClient = null;
 let authToken = null;
 
 const WS_SCHEME = location.protocol === "https:" ? "wss" : "ws";
 const WS_HOST = "127.0.0.1:8000";
+const RABBITMQ_WS_PORT = "15674"; // WebSocket STOMP porta padrão RabbitMQ
+const RABBITMQ_HOST = "127.0.0.1";
 
 function wsUrlWithToken(token) {
   const u = new URL(`${WS_SCHEME}://${WS_HOST}/ws`);
@@ -24,6 +27,13 @@ $(document).ready(function () {
         }
     });
 
+  // Permite login ao pressionar Enter nos campos
+  $("#username, #password").on("keypress", function(e) {
+    if (e.which === 13) {
+      $("#loginBtn").click();
+    }
+  });
+
     $("#logoutBtn").on("click", function () {
         logout();
     });
@@ -32,19 +42,15 @@ $(document).ready(function () {
         const text = $("#msg").val();
         if (!text) return;
 
-        const activeTab = document.querySelector(".tab.active").dataset.target;
-        const payload = (activeTab === "broadcast")
-            ? { type: "message", text }
-            : { type: "message", text, to: activeTab };
-
-        if (!ws || ws.readyState !== WebSocket.OPEN) {
-            log("WebSocket não conectado.");
+        if (!stompClient || !stompClient.connected) {
+            log("STOMP não conectado");
             return;
         }
 
-        ws.send(JSON.stringify(payload));
+        sendMessage(text);
         $("#msg").val("");
 
+        const activeTab = document.querySelector(".tab.active").dataset.target;
         if (activeTab !== "broadcast") {
             appendMessage(activeTab, {
             sender: $("#username").val(),
@@ -93,83 +99,90 @@ function setTyping(typingUsers) {
 }
 
 async function connect() {
+    const username = $("#username").val();
+    const password = $("#password").val();
 
     try {
-        const username = document.getElementById("username").value;
-        const password = document.getElementById("password").value;
+        // Start STOMP listener (RabbitMQ) for presence/messages
+        connectStomp(username);
 
         const token = await login(username, password);
         authToken = token;
 
         if (token) {
             log("Login bem sucedido.");
+            $("#message").text("");
             document.getElementById("loginContainer").style.display = "none";
             document.getElementById("chatContainer").style.display = "block";
             $("#sendBtn").prop("disabled", false);
 
             ws = new WebSocket(wsUrlWithToken(token));
-            $("#sendBtn").prop("disabled", false);
+
+            ws.onopen = async () => {
+                log("Conectado ao websocket.");
+            };
+
+            ws.onmessage = async (e) => {
+                const msg = JSON.parse(e.data);
+                if (msg.type === "message") {
+                    const currentUser = $("#username").val();
+                    const sender = msg.sender || currentUser;
+                    const targetName = msg.to ? (sender === currentUser ? msg.to : sender) : "broadcast";
+
+                    if (msg.to && !document.getElementById(`tab-${sender}`) && sender !== currentUser) {
+                        ensureTab(sender);
+                    }
+
+                    appendMessage(targetName, {
+                        sender,
+                        text: msg.text,
+                        sent_at: msg.sent_at
+                    });
+                } else if (msg.type === "presence" || msg.type === "system") {
+                    try { await refreshUsers(); } catch (err) { console.error(err); }
+                } else {
+                    log(msg);
+                }
+            };
+
+            ws.onerror = (e) => {
+                console.error("WebSocket error:", e);
+                log("Erro no websocket.");
+                $("#sendBtn").prop("disabled", true);
+            };
+
+            ws.onclose = (e) => {
+                log(`WS close: code=${e.code} reason=${e.reason} clean=${e.wasClean}`);
+                $("#sendBtn").prop("disabled", true);
+            };
 
             const users = await getUsers(token);
             log("Usuários: " + users.map(u => u.username).join(", "));
             await refreshUsers();
         } else {
             log("Falha no login.");
+            $("#message").text("Usuário ou senha inválidos.");
         }
     } catch (err) {
         console.error("Erro no login:", err);
         log("Falha no login.");
+        $("#message").text("Erro ao conectar. Verifique usuário, senha e conexão com o servidor.");
     }
-
-    ws.onopen = async () => {
-        log("Conectado ao websocket.");
-    };
-
-    ws.onmessage = async (e) => {
-        const msg = JSON.parse(e.data);
-        if (msg.type === "message") {
-            const currentUser = $("#username").val();
-            const sender = msg.sender || currentUser;
-            const targetName = msg.to ? (sender === currentUser ? msg.to : sender) : "broadcast";
-
-            if (msg.to && !document.getElementById(`tab-${sender}`) && sender !== currentUser) {
-            ensureTab(sender);
-            }
-
-            appendMessage(targetName, {
-            sender,
-            text: msg.text,
-            sent_at: msg.sent_at
-            });
-        } else if (msg.type === "presence" || msg.type === "system") {
-            try { await refreshUsers(); } catch (err) { console.error(err); }
-        } else {
-            log(msg);
-        }
-    };
-
-    ws.onerror = (e) => {
-        console.error("WebSocket error:", e);
-        log("Erro no websocket.");
-        $("#sendBtn").prop("disabled", true);
-    };
-
-    ws.onclose = (e) => {
-        log(`WS close: code=${e.code} reason=${e.reason} clean=${e.wasClean}`);
-        $("#sendBtn").prop("disabled", true);
-    };
 }
 
 async function login(username, password) {
-    const response = await fetch("http://127.0.0.1:8000/login", {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: new URLSearchParams({ username, password })
-    });
-    if (!response.ok) throw new Error("Erro na requisição: " + response.status);
+  const response = await fetch("http://127.0.0.1:8000/login", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      "Cache-Control": "no-cache"
+    },
+    body: new URLSearchParams({ username, password })
+  });
+  if (!response.ok) throw new Error("Erro na requisição: " + response.status);
 
-    const data = await response.json();
-    return data.access_token;
+  const data = await response.json();
+  return data.access_token;
 }
 
 async function getUsers(token) {
@@ -185,6 +198,7 @@ async function getUsers(token) {
 }
 
 function logout() {
+    disconnectStomp();
     try { if (ws && ws.readyState !== WebSocket.CLOSED) ws.close(); } catch (_) {}
     ws = null;
     authToken = null;
@@ -223,11 +237,17 @@ function renderUsers(users) {
     li.className = `user ${u.online ? "online" : "offline"}`;
     li.innerHTML = `<span class="dot"></span> ${u.username}`;
 
-    if (u.online) {
+    // Allow opening a chat with any user (online or offline), except yourself
+    const me = $("#username").val();
+    if (u.username !== me) {
+      li.style.cursor = "pointer";
+      li.title = u.online ? "Abrir chat" : "Abrir chat (offline)";
       li.addEventListener("click", () => ensureTab(u.username));
     } else {
-      li.style.cursor = "default";
+      li.style.fontStyle = "italic";
+      li.title = "Você";
     }
+
     usersUl.appendChild(li);
   });
 }
@@ -331,6 +351,23 @@ function appendMessage(target, { sender, text, sent_at }) {
     ? document.getElementById(`tab-${target}`) 
     : document.querySelector(".tab-content.active");
   const isMe = (sender === $("#username").val());
+  // Simple dedupe: if the last message in the box has same sender and text, skip
+  try {
+    const last = box.lastElementChild;
+    if (last) {
+      const lastMeta = last.querySelector('.meta');
+      const lastBubble = last.querySelector('.bubble');
+      if (lastMeta && lastBubble) {
+        const lastSender = lastMeta.textContent.split(' • ')[0];
+        const lastText = lastBubble.textContent;
+        if (lastSender === sender && lastText === text) {
+          return; // duplicate, ignore
+        }
+      }
+    }
+  } catch (e) {
+    // ignore dedupe errors
+  }
 
   const wrapper = document.createElement("div");
   wrapper.className = `msg ${isMe ? "me" : "other"}`;

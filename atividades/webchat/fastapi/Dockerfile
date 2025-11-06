@@ -24,7 +24,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     UVICORN_WORKERS=2 \
     UVICORN_HOST=0.0.0.0
 
-# cria usuário não-root
+# Cria usuário não-root e adiciona RabbitMQ repo
 RUN useradd -m appuser
 
 WORKDIR /app
